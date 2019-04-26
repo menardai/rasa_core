@@ -1,10 +1,13 @@
 import re
 import json
 import logging
+import os
+import requests
+
 from sanic import Blueprint, response
 from sanic.request import Request
 from slackclient import SlackClient
-from typing import Text, Optional, List
+from typing import Text, Optional, List, Dict, Any
 
 from rasa.core.channels import InputChannel
 from rasa.core.channels.channel import UserMessage, OutputChannel
@@ -44,11 +47,34 @@ class SlackBot(SlackClient, OutputChannel):
 
     async def send_attachment(self, recipient_id, attachment, message=""):
         recipient = self.slack_channel or recipient_id
-        return super(SlackBot, self).api_call("chat.postMessage",
-                                              channel=recipient,
-                                              as_user=True,
-                                              text=message,
-                                              attachments=attachment)
+
+        if attachment and attachment[0] and 'file' in attachment[0]:
+            logger.info(f"*** Uploading image: {attachment[0]['file']} ***")
+            file_exists = os.path.isfile(attachment[0]['file'])
+            logger.info(f"*** {attachment[0]['file']} - file exists = {file_exists} ***")
+
+            # upload file
+            try:
+                with open(attachment[0]['file'], 'rb') as file_content:
+                    result = super(SlackBot, self).api_call("files.upload",
+                                                            channels=recipient,  # important: channels and not channel
+                                                            file=file_content,
+                                                            title=attachment[0].get('title'))
+                if not result.get('ok'):
+                    logger.info(f"*** Slack returns an error: {result['error']} ***")
+
+                return result
+            except Exception as e:
+                logger.info("*** Exception uploading image ***")
+                logger.info(e)
+
+        else:
+            # post with image_url
+            return super(SlackBot, self).api_call("chat.postMessage",
+                                                  channel=recipient,
+                                                  as_user=True,
+                                                  text=message,
+                                                  attachments=attachment)
 
     @staticmethod
     def _convert_to_slack_buttons(buttons):
@@ -136,7 +162,8 @@ class SlackInput(InputChannel):
         return (slack_event.get('event') and
                 (slack_event.get('event').get('type') == u'message' or
                  slack_event.get('event').get('type') == u'app_mention') and
-                slack_event.get('event').get('text') and not
+                (slack_event.get('event').get('text') or
+                 slack_event.get('event').get('subtype') == u'file_share') and not
                 slack_event.get('event').get('bot_id'))
 
     @staticmethod
@@ -186,7 +213,7 @@ class SlackInput(InputChannel):
         return text.rstrip().lstrip()  # drop extra spaces at beginning and end
 
     async def process_message(self, request: Request, on_new_message, text,
-                              sender_id):
+                              sender_id, files=None):
         """Slack retries to post messages up to 3 times based on
         failure conditions defined here:
         https://api.slack.com/events-api#failure_conditions
@@ -203,8 +230,9 @@ class SlackInput(InputChannel):
 
         try:
             out_channel = SlackBot(self.slack_token, self.slack_channel)
-            user_msg = UserMessage(text, out_channel, sender_id,
-                                   input_channel=self.name())
+            user_msg = UserMessageWithImage(text, out_channel, sender_id,
+                                    input_channel=self.name(),
+                                    files=files, slack_token=self.slack_token)
 
             await on_new_message(user_msg)
         except Exception as e:
@@ -244,8 +272,62 @@ class SlackInput(InputChannel):
                         text=self._sanitize_user_message(
                             output['event']['text'],
                             output['authed_users']),
-                        sender_id=output.get('event').get('user'))
+                        sender_id=output.get('event').get('user'),
+                        files=output.get('event').get('files'))
 
             return response.text("")
 
         return slack_webhook
+
+class UserMessageWithImage(UserMessage):
+    """Represents an incoming message, with support for images uploaded to a channel.
+
+     Includes the channel the responses should be sent to."""
+
+    local_image_dir = "user_images"
+    supported_types = ["jpg", "jpeg", "png", "gif"]
+
+    def __init__(self,
+                 text: Optional[Text],
+                 output_channel: Optional['OutputChannel'] = None,
+                 sender_id: Text = None,
+                 parse_data: Dict[Text, Any] = None,
+                 input_channel: Text = None,
+                 message_id: Text = None,
+                 files: List[Dict[Text, Any]] = None,
+                 slack_token: Text = None
+                 ) -> None:
+        super(UserMessageWithImage, self).__init__(text, output_channel, sender_id, parse_data, input_channel, message_id)
+
+        if files:
+            # Filter the files received to keep only supported image types
+            self.images = [{
+                                "name": img['name'],
+                                "size": img['size'],
+                                "width": img['original_w'],
+                                "height": img['original_h'],
+                                "imageid": img['id'],
+                                "imagetype": img['filetype'],
+                                "url": img['url_private']
+                            } for img in files if img.get('filetype') in UserMessageWithImage.supported_types]
+
+            if self.images:
+                logger.info(f"*** Starting image download... {len(self.images)} images ***")
+                # make sure local folder exists
+                if not os.path.exists(UserMessageWithImage.local_image_dir):
+                    os.makedirs(UserMessageWithImage.local_image_dir)
+
+                # download each image from the url and store them in user_images folder
+                for image in self.images:
+                    r = requests.get(image.pop('url', None), headers={'Authorization': f'Bearer {slack_token}'})
+                    image['local_filename'] = os.path.join(UserMessageWithImage.local_image_dir, image['name'])
+
+                    with open(image['local_filename'], 'wb') as f:
+                        f.write(r.content)
+
+                    logger.info(f"image: {image['name']}, {image['width']}x{image['height']}, "
+                                f"{image['size']} bytes - {image['local_filename']} **")
+
+                # update the text to indicate that an image has been dropped in the conversation
+                # TODO - serialized images object in message text
+                self.text = f'[IMAGEDROPPED]{json.dumps(self.images)}'
